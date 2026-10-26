@@ -177,7 +177,9 @@ pub(crate) static CONSOLE: Lazy<InterruptTicketMutex<Console>> = Lazy::new(|| {
 
 	#[cfg(feature = "xen")]
 	if crate::arch::kernel::xen::is_xen() {
-		return InterruptTicketMutex::new(Console::new(IoDevice::Xen(crate::arch::kernel::xen::Console)));
+		return InterruptTicketMutex::new(Console::new(IoDevice::Xen(
+			crate::arch::kernel::xen::Console,
+		)));
 	}
 
 	InterruptTicketMutex::new(Console::new(IoDevice::Uart(SerialDevice::new())))

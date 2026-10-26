@@ -94,7 +94,9 @@ pub fn boot_processor_init() {
 	debug!("Cr4 = {:?}", Cr4::read());
 	interrupts::install();
 	#[cfg(feature = "xen")]
-	if xen::is_xen() { xen::init_time(); }
+	if xen::is_xen() {
+		xen::init_time();
+	}
 	systemtime::init();
 
 	#[cfg(feature = "acpi")]
@@ -106,7 +108,9 @@ pub fn boot_processor_init() {
 	apic::init();
 	scheduler::install_timer_handler();
 	#[cfg(feature = "xen")]
-	if xen::is_xen() { xen::init_events(); }
+	if xen::is_xen() {
+		xen::init_events();
+	}
 	finish_processor_init();
 }
 

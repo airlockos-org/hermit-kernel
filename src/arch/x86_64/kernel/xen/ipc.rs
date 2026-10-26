@@ -1,9 +1,11 @@
 //! Single-connection platform capability. Static pages remain pinned even when
 //! revocation is refused. No peer-controlled pointer ever becomes a Rust reference.
-use super::*;
 use core::sync::atomic::AtomicBool;
+
 use hermit_sync::InterruptTicketMutex;
 use xen::grant::{ForeignMapping, GrantTable};
+
+use super::*;
 
 static mut TABLE: SharedInfoPage = SharedInfoPage([0; 4096]);
 static mut TX: SharedInfoPage = SharedInfoPage([0; 4096]);

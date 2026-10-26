@@ -1,13 +1,17 @@
 //! Native Xen PVH platform glue. No emulated PC devices are required.
-use crate::errno::Errno;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
 use embedded_io::{ErrorType, Read, ReadReady, Write};
 use xen::event::{EventChannel, EventChannelInterface, RawEventChannelInterface};
 use xen::hypercall::hvm::XenHvmOp;
 use xen::hypercall::sched::{ConsoleIO, SchedOp, console_io, sched_op};
-use xen::io::{XenConsInterface, ring::XenRingError};
-use xen_sys::{NativeXenHypercall, XenHypercall, bindings::*};
+use xen::io::XenConsInterface;
+use xen::io::ring::XenRingError;
+use xen_sys::bindings::*;
+use xen_sys::{NativeXenHypercall, XenHypercall};
+
+use crate::errno::Errno;
 
 static CONSOLE_ADDR: AtomicUsize = AtomicUsize::new(0);
 static CONSOLE_PORT: AtomicU32 = AtomicU32::new(0);
