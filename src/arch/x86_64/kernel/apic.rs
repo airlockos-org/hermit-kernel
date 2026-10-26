@@ -496,6 +496,10 @@ fn default_apic() -> PhysAddr {
 }
 
 fn apic_addr() -> PhysAddr {
+	#[cfg(feature = "xen")]
+	if super::xen::is_xen() {
+		return PhysAddr::new(0xfee0_0000);
+	}
 	#[cfg(feature = "uhyve")]
 	use crate::env::{self, UhyveStartInfo};
 
@@ -560,7 +564,11 @@ pub fn init() {
 		calibrate_timer();
 	}
 
-	// initialize IO-APIC
+	// PVH has a local APIC, but no emulated PC IO-APIC.
+	#[cfg(feature = "xen")]
+	if super::xen::is_xen() {
+		return;
+	}
 	init_ioapic();
 }
 

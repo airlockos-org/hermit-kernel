@@ -35,6 +35,8 @@ mod syscall;
 pub(crate) mod systemtime;
 #[cfg(feature = "vga")]
 pub mod vga;
+#[cfg(feature = "xen")]
+pub(crate) mod xen;
 
 #[cfg(feature = "smp")]
 pub fn get_possible_cpus() -> u32 {
@@ -61,15 +63,28 @@ pub fn get_processor_count() -> u32 {
 pub fn boot_processor_init() {
 	processor::detect_features();
 	processor::configure();
+	#[cfg(feature = "xen")]
+	if xen::is_xen() {
+		println!("HERMIT_XEN_CPU_READY");
+	}
 
 	#[cfg(feature = "vga")]
 	vga::init();
 
 	crate::mm::init();
 	crate::mm::print_information();
+	#[cfg(feature = "xen")]
+	if xen::is_xen() {
+		println!("HERMIT_XEN_MEMORY_READY");
+	}
 	CoreLocal::get().add_irq_counter();
 	gdt::add_current_core();
 	interrupts::load_idt();
+	#[cfg(feature = "xen")]
+	if !xen::is_xen() {
+		pic::init();
+	}
+	#[cfg(not(feature = "xen"))]
 	pic::init();
 
 	processor::detect_frequency();

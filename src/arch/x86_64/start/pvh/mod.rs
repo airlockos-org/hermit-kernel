@@ -41,6 +41,8 @@ unsafe extern "C" fn _start() -> ! {
 
 /// The Rust entry point.
 unsafe extern "C" fn rust_start(start_info_paddr: u32) -> ! {
+	#[cfg(feature = "xen")]
+	crate::arch::kernel::xen::early_init();
 	debug!("Entered Rust.");
 
 	unsafe {

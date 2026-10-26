@@ -465,6 +465,12 @@ impl CpuFrequency {
 	}
 
 	unsafe fn detect(&mut self) {
+		#[cfg(feature = "xen")]
+		if let Some(mhz) = super::xen::tsc_mhz() {
+			self.set_detected_cpu_frequency(mhz, CpuFrequencySources::HypervisorTscInfo)
+				.unwrap();
+			return;
+		}
 		let cpuid = CpuId::new();
 		unsafe {
 			self.detect_from_fdt()
@@ -1086,6 +1092,10 @@ fn qemu_exit(success: bool) {
 
 /// Shutdown the system
 pub fn shutdown(error_code: i32) -> ! {
+	#[cfg(feature = "xen")]
+	if super::xen::is_xen() {
+		super::xen::shutdown(error_code);
+	}
 	qemu_exit(error_code == 0);
 
 	#[cfg(feature = "acpi")]

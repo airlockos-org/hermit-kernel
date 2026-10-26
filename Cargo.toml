@@ -95,6 +95,7 @@ newlib = []
 ##
 ## </div>
 pvh = ["dep:pvh"]
+xen = ["pvh", "dep:xen", "dep:xen-sys"]
 
 ## Enables [Hermit loader] support.
 ##
@@ -348,6 +349,8 @@ vsock = ["virtio-vsock"]
 workspace = true
 
 [dependencies]
+xen = { path = "../xen/xen", optional = true }
+xen-sys = { path = "../xen/xen-sys", optional = true }
 hermit-macro = { version = "=0.1.0", path = "hermit-macro" }
 
 ahash = { version = "0.8", default-features = false }

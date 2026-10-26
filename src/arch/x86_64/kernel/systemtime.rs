@@ -184,7 +184,16 @@ fn boot_time() -> OffsetDateTime {
 
 	// Get the current time in microseconds since the epoch (1970-01-01) from the x86 RTC.
 	// Subtract the timer ticks to get the actual time when Hermit was booted.
-	let current_time = without_interrupts(|| Rtc::new().get_microseconds_since_epoch());
+	let current_time = {
+		#[cfg(feature = "xen")]
+		if super::xen::is_xen() {
+			super::xen::wallclock_micros()
+		} else {
+			without_interrupts(|| Rtc::new().get_microseconds_since_epoch())
+		}
+		#[cfg(not(feature = "xen"))]
+		without_interrupts(|| Rtc::new().get_microseconds_since_epoch())
+	};
 	let boot_micros = current_time - processor::get_timer_ticks();
 	let boot_nanos = i128::from(boot_micros) * 1000;
 	OffsetDateTime::from_unix_timestamp_nanos(boot_nanos).unwrap()

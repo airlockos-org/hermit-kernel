@@ -21,6 +21,8 @@ pub(crate) enum IoDevice {
 	#[cfg(feature = "uhyve")]
 	Uhyve(uhyve::UhyveSerial),
 	Uart(SerialDevice),
+	#[cfg(feature = "xen")]
+	Xen(crate::arch::kernel::xen::Console),
 	#[cfg(feature = "virtio-console")]
 	Virtio(Box<VirtioConsoleDriver>),
 }
@@ -35,6 +37,8 @@ impl Read for IoDevice {
 			#[cfg(feature = "uhyve")]
 			IoDevice::Uhyve(s) => s.read(buf),
 			IoDevice::Uart(s) => s.read(buf),
+			#[cfg(feature = "xen")]
+			IoDevice::Xen(s) => s.read(buf),
 			#[cfg(feature = "virtio-console")]
 			IoDevice::Virtio(s) => s.read(buf),
 		}
@@ -47,6 +51,8 @@ impl ReadReady for IoDevice {
 			#[cfg(feature = "uhyve")]
 			IoDevice::Uhyve(s) => s.read_ready(),
 			IoDevice::Uart(s) => s.read_ready(),
+			#[cfg(feature = "xen")]
+			IoDevice::Xen(s) => s.read_ready(),
 			#[cfg(feature = "virtio-console")]
 			IoDevice::Virtio(s) => s.read_ready(),
 		}
@@ -59,6 +65,8 @@ impl Write for IoDevice {
 			#[cfg(feature = "uhyve")]
 			IoDevice::Uhyve(s) => s.write_all(buf)?,
 			IoDevice::Uart(s) => s.write_all(buf)?,
+			#[cfg(feature = "xen")]
+			IoDevice::Xen(s) => s.write_all(buf)?,
 			#[cfg(feature = "virtio-console")]
 			IoDevice::Virtio(s) => s.write_all(buf)?,
 		};
@@ -165,6 +173,11 @@ pub(crate) static CONSOLE: Lazy<InterruptTicketMutex<Console>> = Lazy::new(|| {
 	#[cfg(feature = "uhyve")]
 	if env::start_info().is_uhyve() {
 		return InterruptTicketMutex::new(Console::new(IoDevice::Uhyve(uhyve::UhyveSerial::new())));
+	}
+
+	#[cfg(feature = "xen")]
+	if crate::arch::kernel::xen::is_xen() {
+		return InterruptTicketMutex::new(Console::new(IoDevice::Xen(crate::arch::kernel::xen::Console)));
 	}
 
 	InterruptTicketMutex::new(Console::new(IoDevice::Uart(SerialDevice::new())))

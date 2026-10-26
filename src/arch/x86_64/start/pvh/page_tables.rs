@@ -41,6 +41,12 @@ static mut LEVEL_3_TABLE: PageTable = {
 	let mut page_table = [ptr::null_mut(); _];
 
 	page_table[0] = (&raw mut LEVEL_2_TABLE).wrapping_byte_add(flags).cast();
+	#[cfg(feature = "xen")]
+	{
+		page_table[1] = (&raw mut XEN_TABLE_1).wrapping_byte_add(flags).cast();
+		page_table[2] = (&raw mut XEN_TABLE_2).wrapping_byte_add(flags).cast();
+		page_table[3] = (&raw mut XEN_TABLE_3).wrapping_byte_add(flags).cast();
+	}
 
 	PageTable(page_table)
 };
@@ -63,3 +69,24 @@ static mut LEVEL_2_TABLE: PageTable = {
 #[repr(align(0x1000))]
 #[repr(C)]
 pub(super) struct PageTable([*mut (); 512]);
+
+// Xen places its console frame in the reserved hole below 4 GiB. Keep it
+// accessible before the allocator exists, using the same 2 MiB boot mappings.
+#[cfg(feature = "xen")]
+const fn xen_table(base: usize) -> PageTable {
+	let mut table = [ptr::null_mut(); 512];
+	let mut i = 0;
+	while i < 512 {
+		table[i] = ptr::with_exposed_provenance_mut(
+			base + i * Size2MiB::SIZE as usize + PAGE_FLAGS.bits() as usize,
+		);
+		i += 1;
+	}
+	PageTable(table)
+}
+#[cfg(feature = "xen")]
+static mut XEN_TABLE_1: PageTable = xen_table(1 << 30);
+#[cfg(feature = "xen")]
+static mut XEN_TABLE_2: PageTable = xen_table(2 << 30);
+#[cfg(feature = "xen")]
+static mut XEN_TABLE_3: PageTable = xen_table(3 << 30);

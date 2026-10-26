@@ -26,6 +26,22 @@ impl Arch {
 			return Ok(());
 		}
 
+		// Nix and other managed toolchains may already supply this target without rustup.
+		let output = crate::rustc()
+			.args(["--print", "target-libdir", "--target", self.triple()])
+			.output()?;
+		if output.status.success() {
+			let directory = String::from_utf8_lossy(&output.stdout);
+			if std::fs::read_dir(directory.trim()).is_ok_and(|mut entries| {
+				entries.any(|entry| {
+					entry.is_ok_and(|entry| {
+						entry.file_name().to_string_lossy().starts_with("libcore-")
+					})
+				})
+			}) {
+				return Ok(());
+			}
+		}
 		let mut rustup = crate::rustup();
 		rustup.args(["target", "add", self.triple()]);
 

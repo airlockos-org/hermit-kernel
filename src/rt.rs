@@ -71,6 +71,8 @@ extern "C" fn initd(_arg: usize) {
 	}
 
 	info!("Jumping into application");
+	#[cfg(feature = "xen")]
+	println!("HERMIT_KERNEL_READY");
 
 	#[cfg(not(test))]
 	unsafe {
