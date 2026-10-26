@@ -41,6 +41,8 @@ pub(crate) fn load_idt() {
 
 #[inline]
 pub(crate) fn enable_and_wait() {
+	#[cfg(all(feature = "xen", not(feature = "idle-poll")))]
+	if super::xen::is_xen() { enable_and_hlt(); return; }
 	#[cfg(feature = "idle-poll")]
 	unsafe {
 		asm!("pause", options(nomem, nostack, preserves_flags));

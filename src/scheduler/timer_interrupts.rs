@@ -11,6 +11,8 @@ use crate::executor::network::wake_network_waker;
 pub enum Source {
 	Network,
 	Scheduler,
+	#[cfg(all(feature = "xen", target_arch = "x86_64"))]
+	XenWait,
 }
 
 /// A slot in the timer list. Each source is represented once. This is so that
@@ -27,11 +29,16 @@ pub struct Slot {
 
 // List of timers with one entry for every possible source.
 #[derive(Debug)]
-pub struct TimerList([Slot; 2]);
+pub struct TimerList([Slot; 2 + cfg!(all(feature = "xen", target_arch = "x86_64")) as usize]);
 
 impl TimerList {
 	pub fn new() -> Self {
 		Self([
+			#[cfg(all(feature = "xen", target_arch = "x86_64"))]
+			Slot {
+				source: Source::XenWait,
+				wakeup_time: u64::MAX,
+			},
 			Slot {
 				source: Source::Network,
 				wakeup_time: u64::MAX,
@@ -150,4 +157,13 @@ pub fn clear_active_and_set_next() {
 	} else {
 		set_oneshot_timer(Some(new_lowest_timer));
 	}
+}
+
+/// Cancel the single IPC waiter after an event wakeup. Caller disables interrupts.
+#[cfg(all(feature = "xen", target_arch = "x86_64"))]
+pub fn cancel_xen_wait() {
+	let timers = &mut core_scheduler().timers;
+	timers.slot_by_source_mut(Source::XenWait).wakeup_time = u64::MAX;
+	let next = timers.next_timer().wakeup_time;
+	set_oneshot_timer((next != u64::MAX).then_some(next));
 }

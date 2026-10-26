@@ -1107,6 +1107,8 @@ pub fn shutdown(error_code: i32) -> ! {
 }
 
 pub fn get_timer_ticks() -> u64 {
+	#[cfg(feature = "xen")]
+	if super::xen::clock_ready() { return super::xen::now_ns()/1000; }
 	// We simulate a timer with a 1 microsecond resolution by taking the CPU timestamp
 	// and dividing it by the CPU frequency in MHz.
 	get_timestamp() / u64::from(get_frequency())

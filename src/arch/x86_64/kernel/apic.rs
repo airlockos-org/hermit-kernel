@@ -718,6 +718,8 @@ fn __set_oneshot_timer(wakeup_time: Option<u64>) {
 }
 
 pub fn set_oneshot_timer(wakeup_time: Option<u64>) {
+	#[cfg(feature = "xen")]
+	if super::xen::is_xen() { super::xen::set_timer(wakeup_time); return; }
 	without_interrupts(|| {
 		__set_oneshot_timer(wakeup_time);
 	});

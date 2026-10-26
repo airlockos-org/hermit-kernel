@@ -125,13 +125,23 @@ struct SharedInfoPage([u8; 4096]);
 // A dedicated page in the kernel image: it is never part of the allocator.
 static mut SHARED_INFO: SharedInfoPage = SharedInfoPage([0; 4096]);
 
+static CLOCK: xen::time::PvClock =
+	unsafe { xen::time::PvClock::new((&raw const SHARED_INFO).cast()) };
+static EVENTS: xen::event::two_level::TwoLevel =
+	unsafe { xen::event::two_level::TwoLevel::new((&raw mut SHARED_INFO).cast()) };
+static CLOCK_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub fn clock_ready() -> bool {
+	CLOCK_READY.load(Ordering::Acquire)
+}
+pub fn now_ns() -> u64 {
+	CLOCK.now_ns().expect("Xen PV clock snapshot")
+}
 pub fn wallclock_micros() -> u64 {
-	use core::ptr::{addr_of, addr_of_mut, read_volatile};
-	use core::sync::atomic::fence;
+	CLOCK.wallclock_ns().expect("Xen wallclock snapshot") / 1000
+}
+pub fn init_time() {
 	let hyp = hypervisor();
 	let ptr = (&raw mut SHARED_INFO).cast::<shared_info>();
-	// The kernel image is identity mapped, and Xen replaces only this dedicated
-	// page. Called once on the boot CPU before any other shared-info access.
 	let mut map = xen_add_to_physmap {
 		domid: xen_sys::DomId::SELF.0,
 		size: 0,
@@ -142,24 +152,90 @@ pub fn wallclock_micros() -> u64 {
 	unsafe {
 		hyp.hypercall2(
 			__HYPERVISOR_memory_op as _,
-			[XENMEM_add_to_physmap as _, addr_of_mut!(map).addr()],
+			[XENMEM_add_to_physmap as _, (&raw mut map).addr()],
 		)
-		.expect("map Xen shared info");
-		loop {
-			let version = read_volatile(addr_of!((*ptr).wc_version));
-			if version & 1 != 0 {
-				core::hint::spin_loop();
-				continue;
-			}
-			fence(Ordering::Acquire);
-			let seconds = u64::from(read_volatile(addr_of!((*ptr).wc_sec)))
-				| (u64::from(read_volatile(addr_of!((*ptr).wc_sec_hi))) << 32);
-			let nanos = u64::from(read_volatile(addr_of!((*ptr).wc_nsec)));
-			let now = hyp.get_time().expect("Xen time");
-			fence(Ordering::Acquire);
-			if version == read_volatile(addr_of!((*ptr).wc_version)) {
-				return seconds * 1_000_000 + (nanos + now) / 1000;
+		.expect("map shared info");
+	}
+	CLOCK_READY.store(true, Ordering::Release);
+	println!("XEN_PVCLOCK_READY ns={}", now_ns());
+}
+
+const EVENT_VECTOR: u8 = 0xf3;
+static TIMER_PORT: AtomicU32 = AtomicU32::new(0);
+static TIMER_DEADLINE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static GENERATION: AtomicU32 = AtomicU32::new(0);
+static EVENT_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static WAIT_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static TIMER_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn init_events() {
+	unsafe {
+		super::interrupts::IDT.lock()[EVENT_VECTOR]
+			.set_handler_fn(event_handler)
+			.set_stack_index(0);
+	}
+	super::interrupts::add_irq_name(EVENT_VECTOR - 32, "Xen events");
+	let hyp = hypervisor();
+	let port = RawEventChannelInterface::new(hyp)
+		.bind_virq(VIRQ_TIMER, 0)
+		.expect("bind Xen timer");
+	TIMER_PORT.store(port.0, Ordering::Release);
+	// public/vcpu.h VCPUOP_stop_periodic_timer=7, vCPU 0. No periodic idle ticks.
+	unsafe {
+		hyp.hypercall3(__HYPERVISOR_vcpu_op as _, [7, 0, 0])
+			.expect("stop periodic Xen timer");
+	}
+	hyp.set_hvm_param(
+		HVM_PARAM_CALLBACK_IRQ,
+		(2u64 << 56) | u64::from(EVENT_VECTOR),
+	)
+	.expect("Xen callback vector");
+	EVENTS.enable_upcalls();
+	EVENTS.unmask(&hyp, port.0).expect("unmask Xen timer");
+	println!("XEN_EVENTS_READY vector={EVENT_VECTOR} timer={}", port.0);
+}
+fn wake_waiters() {
+	GENERATION.fetch_add(1, Ordering::SeqCst);
+	crate::synch::futex::futex_wake(&GENERATION, i32::MAX);
+}
+extern "x86-interrupt" fn event_handler(_frame: super::interrupts::ExceptionStackFrame) {
+	use crate::arch::kernel::core_local::{core_scheduler, increment_irq_counter};
+	use crate::scheduler::PerCoreSchedulerExt;
+	increment_irq_counter(EVENT_VECTOR);
+	let mut timer = false;
+	EVENTS.drain(|port| {
+		EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
+		if port == TIMER_PORT.load(Ordering::Acquire) {
+			timer = true;
+		}
+	});
+	if timer {
+		let deadline = TIMER_DEADLINE.swap(0, Ordering::AcqRel);
+		if deadline != 0 {
+			if now_ns() / 1000 >= deadline {
+				TIMER_COUNT.fetch_add(1, Ordering::Relaxed);
+				crate::scheduler::timer_interrupts::clear_active_and_set_next();
+				core_scheduler().handle_waiting_tasks();
+			} else {
+				set_timer(Some(deadline));
 			}
 		}
 	}
+	wake_waiters();
+	super::apic::eoi();
+	core_scheduler().reschedule();
 }
+pub fn set_timer(deadline: Option<u64>) {
+	let value = deadline.unwrap_or(0);
+	TIMER_DEADLINE.store(value, Ordering::Release);
+	unsafe {
+		hypervisor()
+			.hypercall1(
+				__HYPERVISOR_set_timer_op as _,
+				value.saturating_mul(1000) as usize,
+			)
+			.expect("Xen single shot timer");
+	}
+}
+
+mod ipc;
