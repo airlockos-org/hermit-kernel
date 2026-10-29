@@ -8,7 +8,6 @@ use xen::grant::{ForeignMapping, GrantTable};
 use super::*;
 
 const SLOTS: usize = 64;
-static mut TABLE: SharedInfoPage = SharedInfoPage([0; 4096]);
 static mut TX: [SharedInfoPage; SLOTS] = [const { SharedInfoPage([0; 4096]) }; SLOTS];
 static mut RX: [SharedInfoPage; SLOTS] = [const { SharedInfoPage([0; 4096]) }; SLOTS];
 
@@ -77,7 +76,7 @@ pub extern "C" fn sys_xen_connection_open(peer: u16) -> i32 {
 	};
 	let hyp = hypervisor();
 	if state.table.is_none() {
-		match unsafe { GrantTable::initialize(&hyp, (&raw mut TABLE).cast()) } {
+		match super::grants::table() {
 			Ok(table) => state.table = Some(table),
 			Err(e) => return error(e),
 		}

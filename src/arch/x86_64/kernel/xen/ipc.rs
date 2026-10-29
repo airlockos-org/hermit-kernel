@@ -7,7 +7,6 @@ use xen::grant::{ForeignMapping, GrantTable};
 
 use super::*;
 
-static mut TABLE: SharedInfoPage = SharedInfoPage([0; 4096]);
 static mut TX: SharedInfoPage = SharedInfoPage([0; 4096]);
 static mut RX: SharedInfoPage = SharedInfoPage([0; 4096]);
 static CLAIMED: AtomicBool = AtomicBool::new(false);
@@ -39,7 +38,7 @@ pub extern "C" fn sys_xen_open(peer: u16) -> i32 {
 		return -i32::from(Errno::Busy);
 	}
 	let hyp = hypervisor();
-	let table = match unsafe { GrantTable::initialize(&hyp, (&raw mut TABLE).cast()) } {
+	let table = match super::grants::table() {
 		Ok(v) => v,
 		Err(e) => return error(e),
 	};

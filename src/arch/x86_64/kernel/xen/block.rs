@@ -18,7 +18,6 @@ use super::*;
 const RING_GRANT: u32 = 128;
 const DATA_GRANT: u32 = 129;
 const TIMEOUT_NS: u64 = 5_000_000_000;
-static mut TABLE: SharedInfoPage = SharedInfoPage([0; 4096]);
 static mut RING: SharedInfoPage = SharedInfoPage([0; 4096]);
 static mut DATA: SharedInfoPage = SharedInfoPage([0; 4096]);
 
@@ -323,8 +322,7 @@ pub extern "C" fn sys_xen_block_open() -> i32 {
 			.map_err(|_| io())?;
 		state(&mut xs, &back, &["2"], deadline)?;
 		let hyp = hypervisor();
-		let table =
-			unsafe { GrantTable::initialize(&hyp, (&raw mut TABLE).cast()) }.map_err(|_| io())?;
+		let table = super::grants::table().map_err(|_| io())?;
 		let port = RawEventChannelInterface::new(hyp)
 			.alloc(xen_sys::DomId(peer))
 			.map_err(|_| io())?;
