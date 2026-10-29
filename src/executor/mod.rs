@@ -93,6 +93,9 @@ impl Wake for TaskNotify {
 }
 
 pub(crate) fn run() {
+	#[cfg(feature = "alloc-stats")]
+	alloc_stats::sample();
+
 	without_interrupts(|| {
 		// FIXME: We currently have no more than 3 tasks at a time, so this is fine.
 		// Ideally, we would set this value to 200, but the network task currently immediately wakes up again.
@@ -127,8 +130,6 @@ pub fn init() {
 	network::init();
 	#[cfg(feature = "virtio-vsock")]
 	vsock::init();
-	#[cfg(feature = "alloc-stats")]
-	alloc_stats::init();
 }
 
 /// Blocks the current thread on `f`, running the executor when idling.

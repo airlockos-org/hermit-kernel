@@ -256,7 +256,8 @@ idle-poll = []
 
 #! ### Debugging Features
 
-## Enables regularly printing allocation statistics.
+## Samples heap and free-frame statistics at most once per second while the
+## executor runs. Adds no wakeups; logged maxima are sampled, not exact peaks.
 alloc-stats = ["talc/counters"]
 
 ## Inserts function instrument code for mcount-based tracing.

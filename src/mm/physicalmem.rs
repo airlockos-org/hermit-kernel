@@ -21,6 +21,14 @@ pub static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
 
 pub struct FrameAlloc;
 
+#[cfg(feature = "alloc-stats")]
+impl FrameAlloc {
+	/// Bytes not assigned to heap, stacks, page tables or other frame consumers.
+	pub(crate) fn free_bytes() -> usize {
+		PHYSICAL_FREE_LIST.lock().free_space()
+	}
+}
+
 impl PageRangeAllocator for FrameAlloc {
 	unsafe fn init() {
 		unsafe {
