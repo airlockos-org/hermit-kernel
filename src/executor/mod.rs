@@ -110,11 +110,7 @@ pub(crate) fn run() {
 
 /// Spawns a future on the executor.
 #[cfg_attr(
-	not(any(
-		feature = "shell",
-		feature = "net",
-		feature = "virtio-vsock"
-	)),
+	not(any(feature = "shell", feature = "net", feature = "virtio-vsock")),
 	expect(dead_code)
 )]
 pub(crate) fn spawn<F>(future: F)
