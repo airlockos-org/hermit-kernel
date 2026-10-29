@@ -111,7 +111,6 @@ pub(crate) fn run() {
 /// Spawns a future on the executor.
 #[cfg_attr(
 	not(any(
-		feature = "alloc-stats",
 		feature = "shell",
 		feature = "net",
 		feature = "virtio-vsock"
