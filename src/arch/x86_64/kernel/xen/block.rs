@@ -218,7 +218,7 @@ fn wait(observed: u32, deadline: u64) -> Result<(), i32> {
 	if now_ns() >= deadline {
 		return Err(-i32::from(Errno::Timedout));
 	}
-	let result = super::ipc::sys_xen_wait(observed, deadline);
+	let result = super::wait_for_generation(observed, deadline);
 	if result == 0 || result == -i32::from(Errno::Again) {
 		Ok(())
 	} else {

@@ -132,31 +132,9 @@ pub extern "C" fn sys_xen_now_ns() -> u64 {
 #[hermit_macro::system]
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_xen_wait(observed: u32, deadline_ns: u64) -> i32 {
-	if now_ns() >= deadline_ns {
-		return -i32::from(Errno::Timedout);
-	}
-	WAIT_COUNT.fetch_add(1, Ordering::Relaxed);
-	hermit_sync::without_interrupts(|| {
-		crate::scheduler::timer_interrupts::create_timer_abs(
-			crate::scheduler::timer_interrupts::Source::XenWait,
-			deadline_ns.div_ceil(1000),
-		);
-		// No futex timeout: the shared Xen timer wakes the generation futex.
-		// This avoids a stale timeout waiter being woken a second time by an IRQ.
-		let result = crate::synch::futex::futex_wait(
-			&GENERATION,
-			observed,
-			None,
-			crate::synch::futex::Flags::empty(),
-		);
-		crate::scheduler::timer_interrupts::cancel_xen_wait();
-		if now_ns() >= deadline_ns {
-			-i32::from(Errno::Timedout)
-		} else {
-			result
-		}
-	})
+	super::wait_for_generation(observed, deadline_ns)
 }
+
 #[hermit_macro::system]
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_xen_mask(mask: u32) -> i32 {

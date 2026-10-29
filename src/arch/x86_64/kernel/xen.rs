@@ -242,6 +242,33 @@ pub fn set_timer(deadline: Option<u64>) {
 	}
 }
 
+/// Wait within an existing kernel entry; nesting exported syscalls would reset the kernel stack.
+fn wait_for_generation(observed: u32, deadline_ns: u64) -> i32 {
+	if now_ns() >= deadline_ns {
+		return -i32::from(Errno::Timedout);
+	}
+	WAIT_COUNT.fetch_add(1, Ordering::Relaxed);
+	hermit_sync::without_interrupts(|| {
+		crate::scheduler::timer_interrupts::create_timer_abs(
+			crate::scheduler::timer_interrupts::Source::XenWait,
+			deadline_ns.div_ceil(1000),
+		);
+		// No futex timeout: the shared Xen timer wakes the generation futex.
+		// This avoids a stale timeout waiter being woken a second time by an IRQ.
+		let result = crate::synch::futex::futex_wait(
+			&GENERATION,
+			observed,
+			None,
+			crate::synch::futex::Flags::empty(),
+		);
+		crate::scheduler::timer_interrupts::cancel_xen_wait();
+		if now_ns() >= deadline_ns {
+			-i32::from(Errno::Timedout)
+		} else {
+			result
+		}
+	})
+}
 mod ipc;
 
 mod connections;
