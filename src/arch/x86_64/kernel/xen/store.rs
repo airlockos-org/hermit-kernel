@@ -5,14 +5,14 @@
 //! Unverified boundary: Verus does not model this kernel's HVM hypercalls,
 //! volatile cross-domain memory, atomic publication or scheduler wakeups. Their
 //! correctness depends on Xen's PVH mapping, coherent x86-64 memory and the
-//! existing event/timer implementation. CLAIMED enforces one owner for a fresh
+//! existing event/timer implementation. The domain gate enforces one owner for a fresh
 //! domain; private shadow counters reject observed changes to frontend-owned indices.
 //! The verified plan is used directly for every copied offset and publication
 //! index. Acquire precedes copying; release follows copying. Rust's exclusive
 //! borrows keep the same shadow counters and private buffers for the effect.
 //! Notification failure and timeout propagate to the verified client's poisoned
 //! state; the page/capability is retained until domain teardown, never reopened.
-//! Block's operation guard prevents reentry; its rejecting watch sink is bounded.
+//! The domain Access guard prevents reentry; its rejecting watch sink is bounded.
 //! These are explicit assumptions and checked correspondence, not a proof of
 //! hypercalls, volatile I/O, interrupts or the scheduler. State is volatile;
 //! a failure after index publication or daemon mutation is an uncertain outcome,
@@ -23,19 +23,264 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::ptr;
 use core::sync::atomic::AtomicBool;
 
-use xen::io::store::{Client, Error, Operation, Transport, ring};
+use xen::io::store::{Client, Error, Operation, Transport, domain, ring, transaction};
 
 use super::*;
 
-/// Prevent independent drivers from consuming each other's replies. A future
-/// multi-device owner must distribute mutable access to this single connection.
-static CLAIMED: AtomicBool = AtomicBool::new(false);
+/// Nonblocking admission across sleeping XenStore operations. Never hold an
+/// interrupt/spin mutex across an exchange: a waiter may need the scheduler.
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+/// One domain-owned connection and its verified monotonic initialization state.
+struct Shared {
+	/// Gate is published ready only after connection installation under BUSY.
+	gate: domain::Gate,
+	/// Retained on stream failure; never reopened or reset in this guest boot.
+	connection: Option<Connection>,
+}
+
+/// Raw storage accessible only through the uniquely acquired Access guard.
+struct SharedCell {
+	/// All mutable access is scoped to Access::state's exclusive borrow.
+	value: UnsafeCell<Shared>,
+}
+
+// SAFETY: Access::acquire uses acquire/release atomic exclusion. No IRQ handler
+// accesses this cell; references cannot outlive the guard, and reentry returns
+// Busy. This is a platform synchronization boundary, not a Verus-verified atomic.
+unsafe impl Sync for SharedCell {}
+
+static DOMAIN: SharedCell = SharedCell {
+	value: UnsafeCell::new(Shared {
+		gate: domain::Gate::new(),
+		connection: None,
+	}),
+};
+
+/// Unique permission to borrow the domain state; not returned to device callers.
+struct Access;
+
+impl Access {
+	/// Fail rather than spin if another caller is sleeping inside XenStore.
+	fn acquire() -> Result<Self, i32> {
+		BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+			.map(|_| Self)
+			.map_err(|_| -i32::from(Errno::Busy))
+	}
+
+	/// Borrow shared state only for this uniquely acquired guard's lifetime.
+	fn state(&mut self) -> &mut Shared {
+		// SAFETY: No second Access exists while BUSY is true; the borrow of
+		// this guard prevents releasing BUSY while the reference remains live.
+		unsafe { &mut *DOMAIN.value.get() }
+	}
+}
+
+impl Drop for Access {
+	fn drop(&mut self) {
+		BUSY.store(false, Ordering::Release);
+	}
+}
+
+/// Serialize one bounded effect against the sole retained connection.
+/// Lock order is driver operation guard, then Access; XenStore never calls a
+/// driver while holding Access. Failed initialization is terminal, even if a
+/// caller is interrupted between begin() and finish().
+fn with_connection<T>(work: impl FnOnce(&mut Connection) -> Result<T, i32>) -> Result<T, i32> {
+	let mut access = Access::acquire()?;
+	let shared = access.state();
+	if !shared.gate.usable() {
+		if !shared.gate.begin() {
+			return Err(io());
+		}
+		match Connection::open() {
+			Ok(connection) => {
+				shared.connection = Some(connection);
+				if !shared.gate.finish(true) {
+					return Err(io());
+				}
+			}
+			Err(error) => {
+				shared.gate.finish(false);
+				return Err(error);
+			}
+		}
+	}
+	let Some(connection) = shared.connection.as_mut() else {
+		shared.gate.poison();
+		return Err(io());
+	};
+	if !connection.client.usable() {
+		shared.gate.poison();
+		return Err(io());
+	}
+	let result = work(connection);
+	if !connection.client.usable() {
+		shared.gate.poison();
+	}
+	result
+}
+
+/// Driver-local handle to the domain-owned connection. Closing/dropping a
+/// device does not reset wire identities or revoke other drivers' access.
+/// No connection, event channel or mapping is allocated per handle.
+pub(super) struct Store {
+	/// Kernel-local handle; the domain Access guard owns the actual exclusion.
+	_local: core::marker::PhantomData<*mut ()>,
+}
+
+impl Store {
+	/// Initialize the domain stream once or attach to its existing connection.
+	pub(super) fn open() -> Result<Self, i32> {
+		with_connection(|_| Ok(()))?;
+		Ok(Self {
+			_local: core::marker::PhantomData,
+		})
+	}
+
+	/// Run one nontransactional request without giving a driver wire ownership.
+	pub(super) fn exchange(
+		&mut self,
+		kind: Operation,
+		body: &[u8],
+		deadline: u64,
+	) -> Result<String, i32> {
+		with_connection(|connection| connection.exchange(kind, 0, body, deadline))
+	}
+
+	/// Run one bounded transaction while holding domain stream ownership.
+	/// Commit is explicit after callback success; callback error triggers explicit
+	/// abort. EAGAIN is returned for caller-directed recovery, never replayed.
+	pub(super) fn transaction<T>(
+		&mut self,
+		deadline: u64,
+		work: impl FnOnce(&mut Transaction<'_>) -> Result<T, i32>,
+	) -> Result<T, i32> {
+		with_connection(|connection| {
+			let response = connection
+				.raw(Operation::TransactionStart, 0, b"\0", deadline)
+				.map_err(error_code)?;
+			let Some(id) = transaction::Id::parse(&response) else {
+				connection.client.poison();
+				return Err(io());
+			};
+			let mut scope = Transaction {
+				connection,
+				id,
+				deadline,
+				finished: false,
+			};
+			let result = work(&mut scope);
+			scope.finish(result.is_ok())?;
+			result
+		})
+	}
+
+	/// Read a toolstack-provisioned device node within an absolute deadline.
+	pub(super) fn read(&mut self, path: &str, deadline: u64) -> Result<String, i32> {
+		self.exchange(Operation::Read, format!("{path}\0").as_bytes(), deadline)
+	}
+
+	/// Publish one device setting within an absolute deadline.
+	pub(super) fn write(&mut self, path: &str, value: &str, deadline: u64) -> Result<(), i32> {
+		self.exchange(
+			Operation::Write,
+			format!("{path}\0{value}").as_bytes(),
+			deadline,
+		)
+		.map(|_| ())
+	}
+}
+
+/// Borrowed transaction scope; cannot outlive or retarget its connection.
+/// No Drop-based network cleanup: Store::transaction explicitly ends the scope
+/// on both success and ordinary failure. Drop only quarantines an interrupted
+/// scope; it never sends cleanup or permits replay of an uncertain transaction.
+pub(super) struct Transaction<'a> {
+	/// Same uniquely borrowed connection used to receive the transaction ID.
+	connection: &'a mut Connection,
+	/// Validated daemon identifier, bound to this consuming transaction scope.
+	id: transaction::Id,
+	/// One absolute deadline shared by start, all operations and completion.
+	deadline: u64,
+	/// True only after explicit completion or stream quarantine. Drop sends no
+	/// I/O; an incomplete scope poisons the retained connection.
+	finished: bool,
+}
+
+impl Transaction<'_> {
+	/// Read using this scope's immutable transaction/connection binding.
+	pub(super) fn read(&mut self, path: &str) -> Result<String, i32> {
+		self.connection.exchange(
+			Operation::Read,
+			self.id.wire(),
+			format!("{path}\0").as_bytes(),
+			self.deadline,
+		)
+	}
+
+	/// Write a setting invisible to outside readers until the commit succeeds.
+	pub(super) fn write(&mut self, path: &str, value: &str) -> Result<(), i32> {
+		self.connection
+			.exchange(
+				Operation::Write,
+				self.id.wire(),
+				format!("{path}\0{value}").as_bytes(),
+				self.deadline,
+			)
+			.map(|_| ())
+	}
+
+	/// Consume the scope before sending one end request. Any unexpected outcome
+	/// quarantines the stream; only a valid daemon conflict permits later work.
+	fn finish(mut self, commit: bool) -> Result<(), i32> {
+		let (id, body) = self.id.finish(commit);
+		let result = match self
+			.connection
+			.raw(Operation::TransactionEnd, id, &body, self.deadline)
+		{
+			Ok(response) if transaction::acknowledged(&response) => Ok(()),
+			Err(Error::Daemon(name)) if commit && name == b"EAGAIN" => {
+				Err(-i32::from(Errno::Again))
+			}
+			_ => {
+				self.connection.client.poison();
+				Err(io())
+			}
+		};
+		self.finished = true;
+		result
+	}
+}
+
+impl Drop for Transaction<'_> {
+	fn drop(&mut self) {
+		// Explicit finish performs fallible protocol cleanup. Drop only retains
+		// uncertainty after an interrupted scope, without sending any request.
+		if !self.finished {
+			self.connection.client.poison();
+		}
+	}
+}
+
+/// Translate explicit wire failures to the existing kernel ABI. No error
+/// translation creates successful completion or resets a poisoned client.
+fn error_code(error: Error<i32>) -> i32 {
+	match error {
+		Error::Transport(code) => code,
+		Error::TooLarge => -i32::from(Errno::Inval),
+		Error::Daemon(name) if name == b"ENOENT" => -i32::from(Errno::Noent),
+		_ => io(),
+	}
+}
 
 /// Sole XenStore client for this domain lifetime; never reopened after failure.
-pub(super) struct Store {
+struct Connection {
 	/// Framing and request identity, poisoned on ambiguous exchange failure.
 	client: Client,
 	/// Xen-provided page, retained until the domain is destroyed.
@@ -48,12 +293,9 @@ pub(super) struct Store {
 	response: u32,
 }
 
-impl Store {
+impl Connection {
 	/// Claim the connection before inspecting or consuming its shared indices.
-	pub(super) fn open() -> Result<Self, i32> {
-		CLAIMED
-			.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-			.map_err(|_| -i32::from(Errno::Busy))?;
+	fn open() -> Result<Self, i32> {
 		let hyp = hypervisor();
 		let frame = hyp.get_hvm_param(HVM_PARAM_STORE_PFN).map_err(|_| io())?;
 		let port = hyp
@@ -64,7 +306,7 @@ impl Store {
 		EVENTS.unmask(&hyp, port.0).map_err(|_| io())?;
 		let page = address as *mut u8;
 		// SAFETY: Xen's HVM store PFN is a mapped, page-aligned shared page in
-		// the PVH bootstrap's first 4 GiB. CLAIMED admits one owner for this
+		// the PVH bootstrap's first 4 GiB. The domain gate admits one owner for this
 		// guest lifetime. These ABI index fields are aligned AtomicU32 words;
 		// Xen and the guest use coherent x86-64 acquire/release publication.
 		let load = |offset: usize| unsafe {
@@ -84,13 +326,14 @@ impl Store {
 		})
 	}
 
-	/// Exchange outside a transaction; block discovery does not register watches.
-	pub(super) fn exchange(
+	/// Keep raw typed errors for transaction completion decisions.
+	fn raw(
 		&mut self,
 		kind: Operation,
+		transaction: u32,
 		body: &[u8],
 		deadline: u64,
-	) -> Result<String, i32> {
+	) -> Result<Vec<u8>, Error<i32>> {
 		let mut ring = Ring {
 			page: self.page,
 			port: self.port,
@@ -98,36 +341,26 @@ impl Store {
 			request: &mut self.request,
 			response: &mut self.response,
 		};
+		self.client
+			.exchange(&mut ring, kind, transaction, body, |_| false)
+	}
+
+	/// Interpret a successful byte reply through the verified delimiter choice.
+	fn exchange(
+		&mut self,
+		kind: Operation,
+		transaction: u32,
+		body: &[u8],
+		deadline: u64,
+	) -> Result<String, i32> {
 		let response = self
-			.client
-			.exchange(&mut ring, kind, 0, body, |_| false)
-			.map_err(|error| match error {
-				Error::Transport(code) => code,
-				Error::TooLarge => -i32::from(Errno::Inval),
-				Error::Daemon(name) if name == b"ENOENT" => -i32::from(Errno::Noent),
-				_ => io(),
-			})?;
+			.raw(kind, transaction, body, deadline)
+			.map_err(error_code)?;
 		let length = xen::io::store::text_length(&response);
 		let bytes = response.get(..length).ok_or_else(io)?;
-		// UTF-8 validation and copying are standard-library trusted effects;
-		// delimiter selection is performed by the verified core above.
+		// UTF-8 validation/copying are trusted standard-library effects.
 		let text = core::str::from_utf8(bytes).map_err(|_| io())?;
 		Ok(String::from(text))
-	}
-
-	/// Read a toolstack-provisioned device node within an absolute deadline.
-	pub(super) fn read(&mut self, path: &str, deadline: u64) -> Result<String, i32> {
-		self.exchange(Operation::Read, format!("{path}\0").as_bytes(), deadline)
-	}
-
-	/// Publish one device setting within an absolute deadline.
-	pub(super) fn write(&mut self, path: &str, value: &str, deadline: u64) -> Result<(), i32> {
-		self.exchange(
-			Operation::Write,
-			format!("{path}\0{value}").as_bytes(),
-			deadline,
-		)
-		.map(|_| ())
 	}
 }
 
@@ -251,4 +484,49 @@ impl Transport for Ring<'_> {
 			self.wait(observed)?;
 		}
 	}
+}
+
+/// Exercise two independent device handles and nonblocking reentry in a lab
+/// build. No diagnostic request path or selftest is compiled into normal VMs.
+#[cfg(feature = "xen-store-selftest")]
+pub(super) fn selftest(deadline: u64) -> Result<(), i32> {
+	let mut first = Store::open()?;
+	let mut second = Store::open()?;
+	let identity = first.read("domid", deadline)?;
+	if identity.is_empty() || second.read("domid", deadline)? != identity {
+		return Err(io());
+	}
+	with_connection(|_| {
+		if !matches!(Store::open(), Err(error) if error == -i32::from(Errno::Busy)) {
+			return Err(io());
+		}
+		Ok(())
+	})?;
+	drop(first);
+	let mut third = Store::open()?;
+	if second.read("domid", deadline)? != identity || third.read("domid", deadline)? != identity {
+		return Err(io());
+	}
+	let key = "data/hermit-xen-transaction";
+	second.write(key, "before", deadline)?;
+	let rejected: Result<(), i32> = second.transaction(deadline, |scope| {
+		scope.write(key, "aborted")?;
+		Err(-i32::from(Errno::Inval))
+	});
+	if rejected != Err(-i32::from(Errno::Inval)) || third.read(key, deadline)? != "before" {
+		return Err(io());
+	}
+	second.transaction(deadline, |scope| {
+		scope.write(key, "committed")?;
+		if scope.read(key)? != "committed" {
+			return Err(io());
+		}
+		Ok(())
+	})?;
+	if third.read(key, deadline)? != "committed" {
+		return Err(io());
+	}
+	println!("XENSTORE_TRANSACTION_PASS");
+	println!("XENSTORE_SHARED_PASS");
+	Ok(())
 }

@@ -188,6 +188,8 @@ pub extern "C" fn sys_xen_block_open() -> i32 {
 	}
 	let result = (|| {
 		let deadline = now_ns().saturating_add(TIMEOUT_NS);
+		#[cfg(feature = "xen-store-selftest")]
+		super::store::selftest(deadline)?;
 		let mut xs = Store::open()?;
 		let entries = xs.exchange(
 			xen::io::store::Operation::Directory,
@@ -247,17 +249,19 @@ pub extern "C" fn sys_xen_block_open() -> i32 {
 				)
 				.map_err(|_| io())?;
 		}
-		for (key, value) in [
-			("ring-ref", format!("{RING_GRANT}")),
-			("event-channel", format!("{}", port.0)),
-			("protocol", String::from("x86_64-abi")),
-			("feature-persistent", String::from("0")),
-			("state", String::from("3")),
-		] {
-			device
-				.xs
-				.write(&format!("{}/{key}", device.front), &value, deadline)?;
-		}
+		let front = &device.front;
+		device.xs.transaction(deadline, |scope| {
+			for (key, value) in [
+				("ring-ref", format!("{RING_GRANT}")),
+				("event-channel", format!("{port}", port = device.port.0)),
+				("protocol", String::from("x86_64-abi")),
+				("feature-persistent", String::from("0")),
+				("state", String::from("3")),
+			] {
+				scope.write(&format!("{front}/{key}"), &value)?;
+			}
+			Ok(())
+		})?;
 		state(&mut device.xs, &device.back, &["4"], deadline)?;
 		if device
 			.xs
