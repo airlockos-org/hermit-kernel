@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicBool, fence};
 use xen::grant::GrantTable;
 use xen::io::block::{self as wire, Operation};
 
+use super::store::Store;
 use super::*;
 
 // The endpoint ABI owns grants 8..72; this driver owns disjoint grant entries.
@@ -42,127 +43,6 @@ impl OperationGuard {
 impl Drop for OperationGuard {
 	fn drop(&mut self) {
 		BUSY.store(false, Ordering::Release);
-	}
-}
-
-/// A single XenStore request at a time; response bytes are always private copies.
-struct Store {
-	/// Xen-provided shared page, never owned by the allocator.
-	page: *mut u8,
-	/// XenStore daemon notification port.
-	port: EventChannel,
-	/// Monotonic request ID, never recycled after a protocol error.
-	next: u32,
-}
-
-impl Store {
-	fn open() -> Result<Self, i32> {
-		let hyp = hypervisor();
-		let frame = hyp.get_hvm_param(HVM_PARAM_STORE_PFN).map_err(|_| io())?;
-		let port = hyp
-			.get_hvm_param(HVM_PARAM_STORE_EVTCHN)
-			.map_err(|_| io())?;
-		if frame == 0 || frame >= 1 << 20 {
-			return Err(io());
-		}
-		let port = EventChannel(port.try_into().map_err(|_| io())?);
-		EVENTS.unmask(&hyp, port.0).map_err(|_| io())?;
-		Ok(Self {
-			page: ((frame as usize) << 12) as *mut u8,
-			port,
-			next: 1,
-		})
-	}
-
-	fn exchange(&mut self, kind: u32, body: &[u8], deadline: u64) -> Result<String, i32> {
-		if body.len() > 1008 {
-			return Err(-i32::from(Errno::Inval));
-		}
-		let id = self.next;
-		self.next = id.checked_add(1).ok_or_else(io)?;
-		let mut request = [0; 1024];
-		request[..4].copy_from_slice(&kind.to_le_bytes());
-		request[4..8].copy_from_slice(&id.to_le_bytes());
-		request[12..16].copy_from_slice(&(body.len() as u32).to_le_bytes());
-		request[16..16 + body.len()].copy_from_slice(body);
-		let needed = 16 + body.len();
-		loop {
-			let observed = GENERATION.load(Ordering::SeqCst);
-			let prod = load(self.page, 2052);
-			let cons = load(self.page, 2048);
-			let queued = prod.wrapping_sub(cons) as usize;
-			if queued > 1024 {
-				return Err(io());
-			}
-			if needed <= 1024 - queued {
-				for (index, byte) in request[..needed].iter().enumerate() {
-					unsafe {
-						ptr::write_volatile(self.page.add((prod as usize + index) % 1024), *byte);
-					}
-				}
-				store(self.page, 2052, prod.wrapping_add(needed as u32));
-				notify(self.port)?;
-				break;
-			}
-			wait(observed, deadline)?;
-		}
-		let mut response = [0; 1024];
-		loop {
-			let observed = GENERATION.load(Ordering::SeqCst);
-			let cons = load(self.page, 2056);
-			let available = load(self.page, 2060).wrapping_sub(cons) as usize;
-			if available > 1024 {
-				return Err(io());
-			}
-			if available >= 16 {
-				for (index, byte) in response[..available].iter_mut().enumerate() {
-					*byte = unsafe {
-						ptr::read_volatile(self.page.add(1024 + (cons as usize + index) % 1024))
-					};
-				}
-				let value =
-					|offset| u32::from_le_bytes(response[offset..offset + 4].try_into().unwrap());
-				let length = value(12) as usize;
-				if length > 1008 || value(4) != id || value(8) != 0 {
-					return Err(io());
-				}
-				if available >= 16 + length {
-					store(self.page, 2056, cons.wrapping_add((16 + length) as u32));
-					notify(self.port)?;
-					let text =
-						core::str::from_utf8(&response[16..16 + length]).map_err(|_| io())?;
-					if value(0) == xsd_sockmsg_type_XS_ERROR {
-						return Err(if text.trim_end_matches('\0') == "ENOENT" {
-							-i32::from(Errno::Noent)
-						} else {
-							io()
-						});
-					}
-					if value(0) != kind {
-						return Err(io());
-					}
-					return Ok(String::from(text.trim_end_matches('\0')));
-				}
-			}
-			wait(observed, deadline)?;
-		}
-	}
-
-	fn read(&mut self, path: &str, deadline: u64) -> Result<String, i32> {
-		self.exchange(
-			xsd_sockmsg_type_XS_READ,
-			format!("{path}\0").as_bytes(),
-			deadline,
-		)
-	}
-
-	fn write(&mut self, path: &str, value: &str, deadline: u64) -> Result<(), i32> {
-		self.exchange(
-			xsd_sockmsg_type_XS_WRITE,
-			format!("{path}\0{value}").as_bytes(),
-			deadline,
-		)
-		.map(|_| ())
 	}
 }
 
@@ -309,7 +189,11 @@ pub extern "C" fn sys_xen_block_open() -> i32 {
 	let result = (|| {
 		let deadline = now_ns().saturating_add(TIMEOUT_NS);
 		let mut xs = Store::open()?;
-		let entries = xs.exchange(xsd_sockmsg_type_XS_DIRECTORY, b"device/vbd\0", deadline)?;
+		let entries = xs.exchange(
+			xen::io::store::Operation::Directory,
+			b"device/vbd\0",
+			deadline,
+		)?;
 		let handle: u16 = entries.parse().map_err(|_| -i32::from(Errno::Inval))?;
 		let front = format!("device/vbd/{handle}");
 		let back = xs.read(&format!("{front}/backend"), deadline)?;
