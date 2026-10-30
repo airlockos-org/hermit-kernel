@@ -12,7 +12,12 @@
 //! borrows keep the same shadow counters and private buffers for the effect.
 //! Notification failure and timeout propagate to the verified client's poisoned
 //! state; the page/capability is retained until domain teardown, never reopened.
-//! The domain Access guard prevents reentry; its rejecting watch sink is bounded.
+//! The domain Access guard prevents reentry. The verified mailbox bounds active
+//! and quarantined subscriptions; callbacks only coalesce hints for known labels.
+//! Kernel watch objects bind each key to this sole connection. Their exact
+//! immutable registration body is reused for unwatch and authoritative reads;
+//! untrusted event paths never select those reads. Dropped watch objects retain
+//! their credit until domain teardown; only acknowledged removal returns it.
 //! These are explicit assumptions and checked correspondence, not a proof of
 //! hypercalls, volatile I/O, interrupts or the scheduler. State is volatile;
 //! a failure after index publication or daemon mutation is an uncertain outcome,
@@ -28,7 +33,7 @@ use core::cell::UnsafeCell;
 use core::ptr;
 use core::sync::atomic::AtomicBool;
 
-use xen::io::store::{Client, Error, Operation, Transport, domain, ring, transaction};
+use xen::io::store::{Client, Error, Operation, Transport, domain, ring, transaction, watches};
 
 use super::*;
 
@@ -181,6 +186,36 @@ impl Store {
 		})
 	}
 
+	/// Register a bounded watch, retaining one charged slot until acknowledged
+	/// removal. Dropping the returned watch leaves its slot quarantined; it does
+	/// not perform implicit fallible cleanup or allow its token to be reused.
+	pub(super) fn watch(&mut self, path: &str, deadline: u64) -> Result<Watch<'_>, i32> {
+		let (key, request) = with_connection(|connection| {
+			let key = connection
+				.inbox
+				.reserve()
+				.ok_or_else(|| -i32::from(Errno::Nospc))?;
+			let token = format!("{serial}", serial = key.wire());
+			let Some(request) = watches::Request::new(path.as_bytes(), token.as_bytes(), &key)
+			else {
+				connection.inbox.release(key);
+				return Err(-i32::from(Errno::Inval));
+			};
+			match connection.raw(Operation::Watch, 0, request.bytes(), deadline) {
+				Ok(response) if transaction::acknowledged(&response) => Ok((key, request)),
+				_ => {
+					connection.client.poison();
+					Err(io())
+				}
+			}
+		})?;
+		Ok(Watch {
+			_store: self,
+			key,
+			request,
+		})
+	}
+
 	/// Read a toolstack-provisioned device node within an absolute deadline.
 	pub(super) fn read(&mut self, path: &str, deadline: u64) -> Result<String, i32> {
 		self.exchange(Operation::Read, format!("{path}\0").as_bytes(), deadline)
@@ -194,6 +229,78 @@ impl Store {
 			deadline,
 		)
 		.map(|_| ())
+	}
+}
+
+/// An owned watch registration bound to its originating device handle.
+/// Only explicit close releases its mailbox credit. Dropping/forgetting it
+/// retains a bounded quarantined subscription until domain teardown.
+#[must_use = "close the watch explicitly; dropping it retains the subscription slot"]
+pub(super) struct Watch<'a> {
+	/// Prevent the device handle from disappearing while its watch is in use.
+	_store: &'a mut Store,
+	/// Non-clonable key returned by the domain's sole mailbox.
+	key: watches::Key,
+	/// The same immutable path/token body used for subscribe and unsubscribe.
+	request: watches::Request,
+}
+
+impl Watch<'_> {
+	/// Poll for a coalesced hint, draining queued events without retaining their
+	/// untrusted paths. A true result requires re-reading authoritative nodes.
+	pub(super) fn changed(&mut self, deadline: u64) -> Result<bool, i32> {
+		with_connection(|connection| {
+			connection.refresh(deadline)?;
+			Ok(connection.inbox.take(&self.key))
+		})
+	}
+
+	/// Read the exact authoritative node registered by this watch. Daemon event
+	/// paths are hints only and never choose the node used for this operation.
+	pub(super) fn read(&mut self, deadline: u64) -> Result<String, i32> {
+		with_connection(|connection| {
+			connection.exchange(Operation::Read, 0, self.request.read_body(), deadline)
+		})
+	}
+
+	/// Wait without holding domain Access while idle. Sampling the global event
+	/// generation before checking the ring closes the check/park notification race.
+	/// Expiry without a queued event does not poison an otherwise valid stream.
+	pub(super) fn wait(&mut self, deadline: u64) -> Result<(), i32> {
+		loop {
+			let observed = GENERATION.load(Ordering::SeqCst);
+			if self.changed(deadline)? {
+				return Ok(());
+			}
+			if now_ns() >= deadline {
+				return Err(-i32::from(Errno::Timedout));
+			}
+			let status = wait_for_generation(observed, deadline);
+			if status != 0 && status != -i32::from(Errno::Again) {
+				return Err(status);
+			}
+		}
+	}
+
+	/// Consume this registration and return its credit only after the daemon
+	/// acknowledges the exact original path/token pair. Unknown completion
+	/// poisons the stream and retains the slot instead of permitting reuse.
+	pub(super) fn close(self, deadline: u64) -> Result<(), i32> {
+		with_connection(|connection| {
+			match connection.raw(Operation::Unwatch, 0, self.request.bytes(), deadline) {
+				Ok(response) if transaction::acknowledged(&response) => {
+					if !connection.inbox.release(self.key) {
+						connection.client.poison();
+						return Err(io());
+					}
+					Ok(())
+				}
+				_ => {
+					connection.client.poison();
+					Err(io())
+				}
+			}
+		})
 	}
 }
 
@@ -283,6 +390,8 @@ fn error_code(error: Error<i32>) -> i32 {
 struct Connection {
 	/// Framing and request identity, poisoned on ambiguous exchange failure.
 	client: Client,
+	/// All active and quarantined subscription credits, with coalesced hints.
+	inbox: watches::Inbox,
 	/// Xen-provided page, retained until the domain is destroyed.
 	page: *mut u8,
 	/// Daemon event channel, which is not closed as a device-owned channel.
@@ -319,6 +428,7 @@ impl Connection {
 		}
 		Ok(Self {
 			client: Client::new(),
+			inbox: watches::Inbox::new(),
 			page,
 			port,
 			request,
@@ -341,8 +451,35 @@ impl Connection {
 			request: &mut self.request,
 			response: &mut self.response,
 		};
+		let inbox = &mut self.inbox;
 		self.client
-			.exchange(&mut ring, kind, transaction, body, |_| false)
+			.exchange(&mut ring, kind, transaction, body, |event| {
+				inbox.notify(event.token);
+				true
+			})
+	}
+
+	/// Drain queued asynchronous hints through a harmless own-domain read.
+	/// No round trip is issued while the response ring is empty, and no domain
+	/// guard is held during idle watch waiting. A partial/stalled daemon frame
+	/// remains subject to the caller's absolute deadline and stream poisoning.
+	fn refresh(&mut self, deadline: u64) -> Result<(), i32> {
+		let ring = Ring {
+			page: self.page,
+			port: self.port,
+			deadline,
+			request: &mut self.request,
+			response: &mut self.response,
+		};
+		let Some(plan) = ring::receive(*ring.response, ring.load(2056), ring.load(2060), 1) else {
+			self.client.poison();
+			return Err(io());
+		};
+		if !plan.is_empty() {
+			self.raw(Operation::Read, 0, b"domid\0", deadline)
+				.map_err(error_code)?;
+		}
+		Ok(())
 	}
 
 	/// Interpret a successful byte reply through the verified delimiter choice.
@@ -526,6 +663,21 @@ pub(super) fn selftest(deadline: u64) -> Result<(), i32> {
 	if third.read(key, deadline)? != "committed" {
 		return Err(io());
 	}
+	let mut watcher_handle = Store::open()?;
+	let mut watched = watcher_handle.watch(key, deadline)?;
+	watched.wait(deadline)?;
+	third.write(key, "watched", deadline)?;
+	watched.wait(deadline)?;
+	if watched.read(deadline)? != "watched" {
+		return Err(io());
+	}
+	watched.close(deadline)?;
+	let mut replacement = watcher_handle.watch(key, deadline)?;
+	replacement.wait(deadline)?;
+	third.write(key, "replacement", deadline)?;
+	replacement.wait(deadline)?;
+	replacement.close(deadline)?;
+	println!("XENSTORE_WATCH_PASS");
 	println!("XENSTORE_TRANSACTION_PASS");
 	println!("XENSTORE_SHARED_PASS");
 	Ok(())

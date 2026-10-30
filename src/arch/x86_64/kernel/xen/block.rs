@@ -106,16 +106,12 @@ fn wait(observed: u32, deadline: u64) -> Result<(), i32> {
 }
 
 fn state(xs: &mut Store, back: &str, wanted: &[&str], deadline: u64) -> Result<(), i32> {
+	let mut watch = xs.watch(&format!("{back}/state"), deadline)?;
 	loop {
-		let observed = GENERATION.load(Ordering::SeqCst);
-		if wanted.contains(&xs.read(&format!("{back}/state"), deadline)?.as_str()) {
-			return Ok(());
+		if wanted.contains(&watch.read(deadline)?.as_str()) {
+			return watch.close(deadline);
 		}
-		let short = now_ns().saturating_add(10_000_000).min(deadline);
-		match wait(observed, short) {
-			Err(e) if e == -i32::from(Errno::Timedout) && now_ns() < deadline => (),
-			result => result?,
-		}
+		watch.wait(deadline)?;
 	}
 }
 
