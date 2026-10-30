@@ -7,8 +7,22 @@ The first two integration commits preserve the previously validated boot and IPC
 changes from hermit-xen `8b2abd8f6989d11071f407eb1d760b7061329c8d`.
 They add Xen console/shutdown/bootstrap handling, then integrate event callbacks,
 PV clocks/timers and grant-backed connections with Hermit's scheduler and futexes.
-The application-facing ABI remains `sys_xen_*`. One vCPU, one authorized peer and
-one connection per domain are currently supported; reconnection needs a fresh domain.
+The application-facing ABI remains `sys_xen_*`; the runtime supports one vCPU.
+The legacy IPC connection remains available alongside bounded independent IPC
+endpoints. IPC and network clients share ownership-accounting primitives while
+retaining their separate wire protocols. Drivers share one domain-owned XenStore
+connection and one grant-table mapping, with disjoint grant-reference ranges.
+
+Native raw Ethernet supports one upstream netfront and bounded downstream netback
+clients. A netfront can reopen only after acknowledged teardown and withdrawal of
+all old grants; uncertainty retains its pages until domain destruction. A netback
+lease binds an explicitly selected frontend lifetime. The existing trusted Xen
+lifecycle owner must retire that lease before allowing domain-ID recreation or
+reuse. Production Qubes policy and lifecycle integration belong to the consumer.
+Verified protocol cores decide byte ranges, queue occupancy, scoped ownership and
+state transitions. Xen effects, physical-resource correspondence and runtime
+scheduling remain explicit trusted boundaries beside the adapters; the entire
+kernel/driver is not formally verified.
 
 The optional Xen Cargo dependencies use the sibling `../rust-vmm-xen` checkout.
 The integration repository pins that checkout; there is no second fetched Xen source.

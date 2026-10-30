@@ -99,6 +99,7 @@ xen = ["pvh", "dep:xen", "dep:xen-sys"]
 
 ## Run XenStore ownership/negotiation checks in explicit laboratory fixtures.
 xen-store-selftest = ["xen"]
+xen-net-selftest = ["xen"]
 
 ## Enables [Hermit loader] support.
 ##

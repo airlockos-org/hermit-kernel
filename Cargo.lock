@@ -2397,6 +2397,7 @@ dependencies = [
 name = "xen"
 version = "0.1.0"
 dependencies = [
+ "xen-guest-core",
  "xen-net-protocol",
  "xen-store-protocol",
  "volatile 0.6.1",
@@ -2587,6 +2588,7 @@ dependencies = [
 name = "xen-store-protocol"
 version = "0.1.0"
 dependencies = [
+ "xen-guest-core",
  "vstd",
 ]
 
@@ -2595,6 +2597,15 @@ dependencies = [
 name = "xen-net-protocol"
 version = "0.1.0"
 dependencies = [
+ "xen-guest-core",
  "vstd",
  "xen-store-protocol",
+]
+
+
+[[package]]
+name = "xen-guest-core"
+version = "0.1.0"
+dependencies = [
+ "vstd",
 ]

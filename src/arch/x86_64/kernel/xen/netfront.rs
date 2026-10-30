@@ -21,9 +21,10 @@ use core::sync::atomic::{AtomicBool, fence};
 use xen::grant::GrantTable;
 use xen::io::net::bus::{Life, State};
 use xen::io::net::loans::{Completion, Direction, Page};
-use xen::io::net::queue::{Front, Slot};
+use xen::io::net::queue::Front;
 use xen::io::net::{self as wire, Receive};
 
+use super::netring::Ring;
 use super::store::Store;
 use super::*;
 
@@ -40,7 +41,7 @@ static mut RX_DATA: SharedInfoPage = SharedInfoPage([0; 4096]);
 
 /// Nonblocking exclusive access; driver guard precedes the shared XenStore guard.
 static BUSY: AtomicBool = AtomicBool::new(false);
-/// Conservative single attachment per domain; failed opens never reuse pages.
+/// Exclusive attachment; only fully confirmed teardown permits another open.
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 
 struct Owned {
@@ -99,46 +100,6 @@ fn io() -> i32 {
 	-i32::from(Errno::Io)
 }
 
-/// Acquire one aligned native header field from a permanently pinned ring.
-fn load(page: *mut u8, offset: usize) -> u32 {
-	unsafe { AtomicU32::from_ptr(page.add(offset).cast()).load(Ordering::Acquire) }
-}
-
-/// Release-publish a local native header field after its descriptor copy.
-fn store(page: *mut u8, offset: usize, value: u32) {
-	unsafe {
-		AtomicU32::from_ptr(page.add(offset).cast()).store(value, Ordering::Release);
-	}
-}
-
-/// Follow only checked offsets from one private queue plan, without slices into
-/// mutable peer memory. The plan remains with the same exclusive queue owner.
-fn write_slot<const N: usize>(page: *mut u8, slot: &Slot, bytes: &[u8; N]) -> Result<(), i32> {
-	if N > slot.len() {
-		return Err(io());
-	}
-	for (index, byte) in bytes.iter().enumerate() {
-		let offset = slot.byte(index).ok_or_else(io)?;
-		unsafe {
-			ptr::write_volatile(page.add(offset), *byte);
-		}
-	}
-	Ok(())
-}
-
-/// Copy a bounded, potentially hostile descriptor to private memory once.
-fn read_slot<const N: usize>(page: *mut u8, slot: &Slot) -> Result<[u8; N], i32> {
-	if N > slot.len() {
-		return Err(io());
-	}
-	let mut bytes = [0; N];
-	for (index, byte) in bytes.iter_mut().enumerate() {
-		let offset = slot.byte(index).ok_or_else(io)?;
-		*byte = unsafe { ptr::read_volatile(page.add(offset)) };
-	}
-	Ok(bytes)
-}
-
 /// Wait on bounded watch hints, rereading the configured peer's exact state.
 fn state(
 	xs: &mut Store,
@@ -167,9 +128,9 @@ impl Device {
 	}
 
 	/// Notify only when Xen's standard event threshold requests it.
-	fn notify(&self, ring: *mut u8, old: u32, next: u32) -> Result<(), i32> {
+	fn notify(&self, ring: &Ring<'_>, old: u32, next: u32) -> Result<(), i32> {
 		fence(Ordering::SeqCst);
-		if xen::io::store::ring::event_needed(old, next, load(ring, 4)) {
+		if xen::io::store::ring::event_needed(old, next, ring.request_event()) {
 			RawEventChannelInterface::new(hypervisor())
 				.send(self.port)
 				.map_err(|_| io())?;
@@ -183,10 +144,10 @@ impl Device {
 		if !self.rx_page.reusable() {
 			return Ok(());
 		}
-		let ring = (&raw mut RX_RING).cast::<u8>();
+		let ring = unsafe { Ring::borrow((&raw mut RX_RING).cast::<u8>(), &self.life) }?;
 		let slot = self
 			.rx
-			.request(load(ring, 0))
+			.request(ring.request_producer())
 			.map_err(|_| io())?
 			.ok_or_else(io)?;
 		if !self.rx_page.offer(u64::MAX) {
@@ -201,27 +162,23 @@ impl Device {
 				)
 				.map_err(|_| io())?;
 		}
-		write_slot(ring, &slot, &wire::rx_request(RX_DATA_GRANT, 0))?;
+		ring.write(&slot, &wire::rx_request(RX_DATA_GRANT, 0))?;
 		let old = slot.current();
 		let next = slot.published();
 		if !self.rx.posted(slot) {
 			return Err(io());
 		}
-		store(ring, 0, next);
-		self.notify(ring, old, next)
+		ring.publish_request(next);
+		self.notify(&ring, old, next)
 	}
 
 	/// Accept at most one TX completion and make one revoke attempt. A peer
 	/// retaining its mapping returns immediately and is quarantined on expiry.
 	fn poll_transmit(&mut self) -> Result<(), i32> {
-		let ring = (&raw mut TX_RING).cast::<u8>();
+		let ring = unsafe { Ring::borrow((&raw mut TX_RING).cast::<u8>(), &self.life) }?;
 		if self.tx_page.awaiting() {
-			if let Some(slot) = self
-				.tx
-				.response(load(ring, 0), load(ring, 8))
-				.map_err(|_| io())?
-			{
-				let bytes = read_slot::<4>(ring, &slot)?;
+			if let Some(slot) = ring.front_response(&self.tx)? {
+				let bytes = ring.read::<4>(&slot)?;
 				let sent = wire::tx_response(&bytes, 0).map_err(|_| io())?;
 				if !self.tx_page.complete(
 					Completion::Transmit(sent),
@@ -236,7 +193,7 @@ impl Device {
 			let revoked = self.table.revoke(TX_DATA_GRANT).map_err(|_| io())?;
 			let _ = self.tx_page.reclaim(revoked);
 		}
-		store(ring, 12, self.tx.event());
+		ring.set_response_event(self.tx.event());
 		fence(Ordering::SeqCst);
 		if self.tx_page.expire(now_ns()) {
 			return Err(-i32::from(Errno::Timedout));
@@ -252,10 +209,10 @@ impl Device {
 		if !self.tx_page.reusable() {
 			return Err(-i32::from(Errno::Again));
 		}
-		let ring = (&raw mut TX_RING).cast::<u8>();
+		let ring = unsafe { Ring::borrow((&raw mut TX_RING).cast::<u8>(), &self.life) }?;
 		let slot = self
 			.tx
-			.request(load(ring, 0))
+			.request(ring.request_producer())
 			.map_err(|_| io())?
 			.ok_or_else(io)?;
 		// Exclusive page ownership was checked before any CPU access. Caller
@@ -275,28 +232,39 @@ impl Device {
 				)
 				.map_err(|_| io())?;
 		}
-		write_slot(ring, &slot, &request)?;
+		#[cfg(feature = "xen-net-selftest")]
+		let request = {
+			let mut request = request;
+			if FAULT.load(Ordering::Acquire) == 1 {
+				request[6] = 4;
+			}
+			request
+		};
+		ring.write(&slot, &request)?;
 		let old = slot.current();
 		let next = slot.published();
 		if !self.tx.posted(slot) {
 			return Err(io());
 		}
-		store(ring, 0, next);
-		self.notify(ring, old, next)
+		let published = next;
+		#[cfg(feature = "xen-net-selftest")]
+		let published = if FAULT.load(Ordering::Acquire) == 2 {
+			next.wrapping_add(256)
+		} else {
+			next
+		};
+		ring.publish_request(published);
+		self.notify(&ring, old, published)
 	}
 
 	/// Consume at most one RX descriptor. Completion stays in the loan object
 	/// until revoke succeeds; only then may bounded offsets touch the data page.
 	fn receive(&mut self, buffer: *mut u8) -> Result<usize, i32> {
 		self.poll_transmit()?;
-		let ring = (&raw mut RX_RING).cast::<u8>();
+		let ring = unsafe { Ring::borrow((&raw mut RX_RING).cast::<u8>(), &self.life) }?;
 		if self.rx_page.awaiting() {
-			if let Some(slot) = self
-				.rx
-				.response(load(ring, 0), load(ring, 8))
-				.map_err(|_| io())?
-			{
-				let bytes = read_slot::<8>(ring, &slot)?;
+			if let Some(slot) = ring.front_response(&self.rx)? {
+				let bytes = ring.read::<8>(&slot)?;
 				let received = wire::rx_response(&bytes, 0).map_err(|_| io())?;
 				if !self.rx_page.complete(
 					Completion::Receive(received),
@@ -326,7 +294,7 @@ impl Device {
 		if self.rx_page.expire(now_ns()) {
 			return Err(-i32::from(Errno::Timedout));
 		}
-		store(ring, 12, self.rx.event());
+		ring.set_response_event(self.rx.event());
 		fence(Ordering::SeqCst);
 		self.post_receive()?;
 		Ok(length)
@@ -335,7 +303,8 @@ impl Device {
 
 /// Connect vif/0 to the exact peer domain explicitly authorized by the caller.
 /// No automatic discovery may broaden this selection; additional vifs are not
-/// attached by this API. Failed attempts retain their fixed pages until teardown.
+/// attached by this API. Reopen requires fully confirmed previous teardown.
+/// Failed attempts retain their fixed pages until domain teardown.
 #[hermit_macro::system]
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_xen_netfront_open(peer: u16) -> i32 {
@@ -351,6 +320,20 @@ pub extern "C" fn sys_xen_netfront_open(peer: u16) -> i32 {
 	}
 	let result = (|| {
 		let deadline = now_ns().saturating_add(TIMEOUT_NS);
+		// A prior owner can reach this point only after confirmed revoke/unbind.
+		// Clear complete pages before offering them to any newly selected peer.
+		for page in [
+			(&raw mut TX_RING).cast::<u8>(),
+			(&raw mut RX_RING).cast::<u8>(),
+			(&raw mut TX_DATA).cast::<u8>(),
+			(&raw mut RX_DATA).cast::<u8>(),
+		] {
+			for offset in 0..4096 {
+				unsafe {
+					ptr::write_volatile(page.add(offset), 0);
+				}
+			}
+		}
 		let mut xs = Store::open()?;
 		let own = xs.read("domid", deadline)?;
 		let observed_peer = xs.read("device/vif/0/backend-id", deadline)?;
@@ -371,6 +354,7 @@ pub extern "C" fn sys_xen_netfront_open(peer: u16) -> i32 {
 		if !wire::identity::frontend_linked(own.as_bytes(), reciprocal.as_bytes()) {
 			return Err(io());
 		}
+		xs.write("device/vif/0/state", "1", deadline)?;
 		state(&mut xs, &back, State::InitWait, State::InitWait, deadline)?;
 		if xs.read(&format!("{back}/feature-rx-copy"), deadline)? != "1" {
 			return Err(io());
@@ -405,8 +389,9 @@ pub extern "C" fn sys_xen_netfront_open(peer: u16) -> i32 {
 			((&raw mut TX_RING).cast::<u8>(), TX_RING_GRANT),
 			((&raw mut RX_RING).cast::<u8>(), RX_RING_GRANT),
 		] {
-			store(ring, 4, 1);
-			store(ring, 12, 1);
+			let view = unsafe { Ring::borrow(ring, &device.life) }?;
+			view.set_request_event(1);
+			view.set_response_event(1);
 			unsafe {
 				device
 					.table
@@ -582,9 +567,29 @@ pub extern "C" fn sys_xen_netfront_close() -> i32 {
 		unsafe {
 			*DEVICE.device.get() = None;
 		}
+		CLAIMED.store(false, Ordering::Release);
 		println!("XEN_NETFRONT_RELEASED grants=0");
 	} else {
 		device.fail();
 	}
 	result.map_or_else(|error| error, |()| 0)
+}
+
+/// Deliberate hostile-peer fixture mutation, excluded from production kernels.
+/// One adds an unnegotiated fragment flag; two overruns the ring producer. These
+/// bodies intentionally violate the normal codec's contract and prove nothing
+/// about production encoding; they exercise a remote backend's rejection path.
+#[cfg(feature = "xen-net-selftest")]
+static FAULT: AtomicU32 = AtomicU32::new(0);
+
+/// Select one hostile fixture input before sending its single packet.
+#[cfg(feature = "xen-net-selftest")]
+#[hermit_macro::system]
+#[unsafe(no_mangle)]
+pub extern "C" fn sys_xen_netfront_fault(mode: u32) -> i32 {
+	if mode != 1 && mode != 2 {
+		return -i32::from(Errno::Inval);
+	}
+	FAULT.store(mode, Ordering::Release);
+	0
 }

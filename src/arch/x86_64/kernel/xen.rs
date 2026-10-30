@@ -277,6 +277,10 @@ mod block;
 
 mod netfront;
 
+mod netring;
+
+mod netback;
+
 mod store;
 
 mod grants;

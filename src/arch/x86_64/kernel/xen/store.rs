@@ -189,7 +189,9 @@ impl Store {
 	/// Register a bounded watch, retaining one charged slot until acknowledged
 	/// removal. Dropping the returned watch leaves its slot quarantined; it does
 	/// not perform implicit fallible cleanup or allow its token to be reused.
-	pub(super) fn watch(&mut self, path: &str, deadline: u64) -> Result<Watch<'_>, i32> {
+	/// Own a bounded registration independently of this zero-resource Store
+	/// handle. The one domain connection and mailbox retain its real lifetime.
+	pub(super) fn subscribe(&mut self, path: &str, deadline: u64) -> Result<Subscription, i32> {
 		let (key, request) = with_connection(|connection| {
 			let key = connection
 				.inbox
@@ -209,10 +211,20 @@ impl Store {
 				}
 			}
 		})?;
-		Ok(Watch {
-			_store: self,
+		Ok(Subscription {
+			_local: core::marker::PhantomData,
 			key,
 			request,
+		})
+	}
+
+	/// Borrowing convenience for short device-state waits; both forms execute
+	/// the same registration, hint, re-read and acknowledged-removal bodies.
+	pub(super) fn watch(&mut self, path: &str, deadline: u64) -> Result<Watch<'_>, i32> {
+		let inner = self.subscribe(path, deadline)?;
+		Ok(Watch {
+			_store: self,
+			inner,
 		})
 	}
 
@@ -232,20 +244,21 @@ impl Store {
 	}
 }
 
-/// An owned watch registration bound to its originating device handle.
+/// An owned watch registration bound to the sole domain mailbox. Device Store
+/// handles own no connection/mapping, so this may outlive the initiating handle.
 /// Only explicit close releases its mailbox credit. Dropping/forgetting it
 /// retains a bounded quarantined subscription until domain teardown.
 #[must_use = "close the watch explicitly; dropping it retains the subscription slot"]
-pub(super) struct Watch<'a> {
-	/// Prevent the device handle from disappearing while its watch is in use.
-	_store: &'a mut Store,
+pub(super) struct Subscription {
+	/// Kernel-local registration; no transfer to another runtime/IRQ context.
+	_local: core::marker::PhantomData<*mut ()>,
 	/// Non-clonable key returned by the domain's sole mailbox.
 	key: watches::Key,
 	/// The same immutable path/token body used for subscribe and unsubscribe.
 	request: watches::Request,
 }
 
-impl Watch<'_> {
+impl Subscription {
 	/// Poll for a coalesced hint, draining queued events without retaining their
 	/// untrusted paths. A true result requires re-reading authoritative nodes.
 	pub(super) fn changed(&mut self, deadline: u64) -> Result<bool, i32> {
@@ -301,6 +314,37 @@ impl Watch<'_> {
 				}
 			}
 		})
+	}
+}
+
+/// Short borrowed subscription used by existing block/frontend state waits.
+#[must_use = "close the watch explicitly; dropping retains its charged slot"]
+pub(super) struct Watch<'a> {
+	/// Keep the existing caller-facing borrowed handle contract.
+	_store: &'a mut Store,
+	/// Sole actual registration; wrappers never reconstruct token/path decisions.
+	inner: Subscription,
+}
+
+impl Watch<'_> {
+	/// Poll the same coalesced registration without allocating another mailbox.
+	pub(super) fn changed(&mut self, deadline: u64) -> Result<bool, i32> {
+		self.inner.changed(deadline)
+	}
+
+	/// Read exactly the originally registered authoritative node.
+	pub(super) fn read(&mut self, deadline: u64) -> Result<String, i32> {
+		self.inner.read(deadline)
+	}
+
+	/// Wait through the same generation/notification race guard.
+	pub(super) fn wait(&mut self, deadline: u64) -> Result<(), i32> {
+		self.inner.wait(deadline)
+	}
+
+	/// Explicitly remove this same registration after acknowledged completion.
+	pub(super) fn close(self, deadline: u64) -> Result<(), i32> {
+		self.inner.close(deadline)
 	}
 }
 
