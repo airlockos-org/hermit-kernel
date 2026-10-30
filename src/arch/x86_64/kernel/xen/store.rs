@@ -6,7 +6,7 @@
 //! volatile cross-domain memory, atomic publication or scheduler wakeups. Their
 //! correctness depends on Xen's PVH mapping, coherent x86-64 memory and the
 //! existing event/timer implementation. CLAIMED enforces one owner for a fresh
-//! domain; private shadow counters reject changes to frontend-owned indices.
+//! domain; private shadow counters reject observed changes to frontend-owned indices.
 //! The verified plan is used directly for every copied offset and publication
 //! index. Acquire precedes copying; release follows copying. Rust's exclusive
 //! borrows keep the same shadow counters and private buffers for the effect.
@@ -14,7 +14,11 @@
 //! state; the page/capability is retained until domain teardown, never reopened.
 //! Block's operation guard prevents reentry; its rejecting watch sink is bounded.
 //! These are explicit assumptions and checked correspondence, not a proof of
-//! hypercalls, volatile I/O, interrupts or the scheduler. Real-Xen regressions
+//! hypercalls, volatile I/O, interrupts or the scheduler. State is volatile;
+//! a failure after index publication or daemon mutation is an uncertain outcome,
+//! not evidence that nothing changed. No request is replayed on this connection.
+//! A matching XenStore reply is not a disk durability/flush acknowledgement.
+//! Real-Xen regressions
 //! exercise this boundary but do not turn those assumptions into verified facts.
 
 use alloc::format;
