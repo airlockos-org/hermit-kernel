@@ -275,6 +275,8 @@ mod connections;
 
 mod block;
 
+mod netfront;
+
 mod store;
 
 mod grants;

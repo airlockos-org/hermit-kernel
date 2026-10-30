@@ -1,5 +1,5 @@
 //! Map the guest's single v1 grant frame exactly once across IPC and block I/O.
-//! IPC owns entries 8..72; the block frontend owns 128..130. Remapping frame
+//! IPC owns entries 8..72; block owns 128..130; netfront owns 144..148. Remapping frame
 //! zero into each subsystem's own address would invalidate earlier mappings.
 
 use hermit_sync::InterruptTicketMutex;
