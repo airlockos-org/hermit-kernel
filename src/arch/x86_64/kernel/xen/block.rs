@@ -47,7 +47,7 @@ impl Drop for OperationGuard {
 }
 
 struct Device {
-	/// Sole XenStore connection, preserved after errors for teardown only.
+	/// Device-local handle to the shared, domain-owned XenStore connection.
 	xs: Store,
 	/// Toolstack-owned frontend XenStore path.
 	front: String,

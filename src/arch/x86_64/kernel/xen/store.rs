@@ -352,7 +352,7 @@ impl Transaction<'_> {
 			.raw(Operation::TransactionEnd, id, &body, self.deadline)
 		{
 			Ok(response) if transaction::acknowledged(&response) => Ok(()),
-			Err(Error::Daemon(name)) if commit && name == b"EAGAIN" => {
+			Err(Error::Daemon(name)) if transaction::conflict(commit, &name) => {
 				Err(-i32::from(Errno::Again))
 			}
 			_ => {
